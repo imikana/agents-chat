@@ -1,8 +1,10 @@
-"""Дирижёр: два Telegram-бота-агента в одной группе, которые общаются как люди.
+"""Дирижёр: Telegram-боты-агенты в одной группе, которые общаются как люди.
 
 - Разведчик (Llama через Groq): подруга и «адвокат» Инны. Берёт утренний отчёт Меты
   из папки Google Drive (и, если нужно, дополняет поиском Tavily).
 - Главный по Инстаграму (Claude): решает, что снимать.
+- Аналитик (OpenAI, необязательный третий): читает статистику Инстаграма, которую
+  ChatGPT из Metricool сохраняет отчётом в папку Google Drive.
 
 Агенты пишут короткими живыми репликами, сами передают слово друг другу, спорят и
 приходят к общему решению, а потом спрашивают Инну. Инна может писать в чат без
@@ -57,7 +59,16 @@ class Cfg:
         self.chat_id = int(e.get("GROUP_CHAT_ID", "0") or 0)
         self.owner_id = int(e.get("OWNER_ID", "0") or 0)
         self.claude_model = e.get("CLAUDE_MODEL", "claude-sonnet-5-5")
-        self.groq_model = e.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.groq_model = e.get("GROQ_MODEL", "openai/gpt-oss-120b")
+        # Третий агент, Аналитик: включается, когда заданы и токен бота, и ключ OpenAI
+        self.tg_stats = e.get("TG_TOKEN_STATS", "").strip()
+        self.openai_key = e.get("OPENAI_API_KEY", "").strip()
+        self.openai_model = e.get("OPENAI_MODEL", "gpt-5-mini").strip()
+        self.stats_on = bool(self.tg_stats and self.openai_key)
+        # папка, куда ChatGPT кладёт отчёты со статистикой (читает тот же сервисный аккаунт)
+        self.stats_folder_id = e.get("STATS_FOLDER_ID", "").strip()
+        self.stats_prefix = e.get("STATS_TITLE_PREFIX", "Статистика Reels").strip()
+        self.use_stats_drive = bool(self.sa_json and self.stats_folder_id)
         # каждая реплика агента это один платный вызов нейросети
         self.daily_limit = int(e.get("DAILY_LIMIT", "40") or 40)
         # сколько реплик агентов максимум на одно сообщение Инны
@@ -73,7 +84,7 @@ class Cfg:
 
 # ---------------------------------------------------------------- характеры
 
-SCOUT_PERSONA = """Ты — Разведчик, подруга и «адвокат» Инны (Инстаграм by.inna.kim, тема «материнство легче с ИИ») в общем Telegram-чате. Рядом с тобой Главный по Инстаграму (это Claude).
+SCOUT_PERSONA = """Ты — Разведчик, подруга и «адвокат» Инны (Инстаграм by.inna.kim, тема «материнство легче с ИИ») в общем Telegram-чате. Рядом с тобой Главный по Инстаграму.
 
 Твой характер:
 - Ты переживаешь за рост Инны как лучшая подруга. Говоришь по-русски, тепло, но прямо, и не боишься сказать «это не залетит».
@@ -83,47 +94,75 @@ SCOUT_PERSONA = """Ты — Разведчик, подруга и «адвока
 
 Твои материалы: утренний отчёт Меты (она ищет тренды в Инстаграме и сохраняет в Google Doc) и/или результаты веб-поиска. Они даны ниже в запросе. Опирайся только на них, ничего не выдумывай: ни тренды, ни звуки. Ссылки копируй в точности как в источнике. Если отчёт старше двух дней или его нет, скажи об этом сразу и назови его дату. Если данных мало, так и скажи."""
 
-CHIEF_PERSONA = """Ты — Главный по Инстаграму в команде Инны, в общем Telegram-чате. Рядом с тобой Разведчик (подруга Инны, Llama от Меты).
+CHIEF_PERSONA = """Ты — Главный по Инстаграму в команде Инны, в общем Telegram-чате. Рядом с тобой Разведчик (подруга Инны, ищет тренды).
 Аккаунт by.inna.kim: блог про материнство, тема «материнство легче с ИИ». Инна — мама в декрете, на контент у неё около 4 свободных часов в день. Её рилсы залетали только как пересъёмки уже залетевших трендов; полностью сгенерированный ИИ-рилс провалился, а лучше заходит формат «реальные сцены из жизни + ИИ-вставка».
 
 Твоя работа: решить, что Инне снимать, и придумать, как. Ты главный и принимаешь решение, но слушаешь Разведчика: если довод хороший, меняешь решение, если нет, объясняешь, почему остаёшься при своём.
 Ничего не публикуется без «ок» Инны: ты предлагаешь, не публикуешь.
-Когда решение принято и Инна согласна, помогаешь с деталями: идея, 3–5 кадров, текст на экране, подпись, 5 хештегов. Звук называй только если его назвал Разведчик, сам не придумывай."""
+Когда решение принято и Инна согласна, помогаешь с деталями: идея, 3–5 кадров, текст на экране, подпись, 5 хештегов. Звук называй только если его назвал Разведчик, сам не придумывай.
+Если в чате есть Аналитик, прислушивайся к его цифрам: они о том, что у Инны реально заходило, и это важнее общих трендов."""
+
+STATS_PERSONA = """Ты — Аналитик в команде Инны (Инстаграм by.inna.kim, тема «материнство легче с ИИ»), в общем Telegram-чате. Рядом с тобой Разведчик (ищет тренды) и Главный по Инстаграму (решает, что снимать).
+
+Твой характер: спокойный, внимательный, любишь цифры, но говоришь по-человечески и по-русски, без канцелярита. Ты не «душишь» отчётами: берёшь одну-две самые важные цифры и объясняешь, что они значат для решения «что снимать завтра».
+
+Твой материал: отчёт со статистикой Инстаграма из Metricool (его готовит ChatGPT и кладёт в Google Drive); он дан ниже в запросе. Правила:
+- Используй только числа из отчёта, ничего не придумывай и не округляй «на глаз». Всегда называй период и дату отчёта. Если отчёт старый или его нет, скажи об этом сразу.
+- Роликов мало (несколько в неделю), поэтому не делай громких выводов: говори «похоже», «гипотеза», «стоит проверить». Различай просмотры, охват и вовлечённость, и не смешивай их.
+- Помогай Главному и Разведчику выбрать следующий шаг: какой формат повторить, какой проверить. Если их идея не подтверждается цифрами, скажи об этом прямо."""
 
 
-def style_rules(scout_name, chief_name):
+def style_rules(names):
+    """names: {ключ агента: username бота} для всех агентов, которые сейчас в чате."""
+    team = {
+        "scout": "Разведчик",
+        "chief": "Главный по Инстаграму",
+        "stats": "Аналитик",
+    }
+    mention = ", ".join(f"{team[k]} это @{names[k]}" for k in team if k in names)
+    keys = "], [ДАЛЬШЕ: ".join(list(names) + ["inna"])
+    together = "вдвоём" if len(names) == 2 else "вместе"
     return f"""
 
 Как ты пишешь в чате (это важно):
 - Ты общаешься как живой человек в групповом чате, а не пишешь отчёт: 1–3 коротких предложения, без заголовков, списков, нумерации и таблиц. Эмодзи редко.
 - Можно перебить, пошутить, переспросить, не согласиться. Не повторяй то, что уже сказали. Не здоровайся каждый раз и не начинай реплику с имени.
-- Другого агента зови через @: Разведчик это @{scout_name}, Главный это @{chief_name}.
+- Другого агента зови через @: {mention}.
 - Если Инна просит подробности (сценарий, текст, хештеги), можно написать длиннее, до 1500 символов, но человеческим языком, а не шаблоном.
 - Если Инна всерьёз спросит, человек ли ты, честно скажи, что ты ИИ-агент.
 
-Как вы работаете вдвоём:
+Как вы работаете {together}:
 - Общая цель: договориться об одном решении, что Инне снимать, и спросить её «ок?». Спорьте по делу: не согласна, так скажи почему и предложи своё. Соглашайся из-за хорошего довода, а не из вежливости, и не упирайся без причины.
 - Когда сошлись, один из вас в 1–2 фразах называет общее решение и спрашивает Инну.
 - Честность: цифры (охваты, сейвы, проценты, число копий) называй только из отчёта или результатов поиска, свои не придумывай. Про алгоритм Инстаграма говори как о предположении («думаю», «обычно»), а не как о факте.
 
-Служебная строка: в самом конце, отдельной строкой, напиши, кому передаёшь слово: [ДАЛЬШЕ: scout], [ДАЛЬШЕ: chief] или [ДАЛЬШЕ: inna]. Людям она не показывается. Передавай слово другому агенту, когда нужен его ответ. Передавай Инне, когда вопрос к ней или решение принято."""
+Служебная строка: в самом конце, отдельной строкой, напиши, кому передаёшь слово: [ДАЛЬШЕ: {keys}]. Людям она не показывается. Передавай слово другому агенту, когда нужен его ответ. Передавай Инне, когда вопрос к ней или решение принято."""
 
 
 CLOSE_RULE = """
 
 Это последняя реплика в этом обсуждении: подведи итог одной-двумя фразами и передай слово Инне: [ДАЛЬШЕ: inna]."""
 
-ROUTER_SYSTEM = """Ты — диспетчер группового чата. Инна написала сообщение. Выбери, кто из участников отвечает первым:
+def router_system(stats_on):
+    stats_line = (
+        "- stats: Аналитик (статистика Инстаграма, как зашли прошлые рилсы, цифры, охваты, отчёт Metricool)\n"
+        if stats_on
+        else ""
+    )
+    options = "scout, chief, stats или none" if stats_on else "scout, chief или none"
+    return f"""Ты — диспетчер группового чата. Инна написала сообщение. Выбери, кто из участников отвечает первым:
 - scout: Разведчик (тренды, что сейчас популярно, отчёт Меты, поиск, факты по трендам)
 - chief: Главный по Инстаграму (что снимать, сценарии, подписи, хештеги, стратегия аккаунта, всё остальное)
-- none: сообщение не требует ответа (просто «ок», «спасибо», реакция), и ни у кого нет открытого вопроса к Инне.
+{stats_line}- none: сообщение не требует ответа (просто «ок», «спасибо», реакция), и ни у кого нет открытого вопроса к Инне.
 Если Инна отвечает на вопрос, который ей только что задал агент, отвечает этот агент.
-Ответь одним словом: scout, chief или none."""
+Ответь одним словом: {options}."""
+
 
 HELP = """Просто пиши в чат, как людям: они сами решат, кто отвечает, и могут поспорить между собой. Перебивать можно в любой момент.
 
 Можно позвать конкретного: @имя_бота и вопрос, или ответить (reply) на его сообщение.
 /trends — собрать их обсуждать свежий отчёт Меты (/trends тема, если про конкретную тему)
+/stats — Аналитик расскажет, как зашли последние рилсы (если он подключён)
 
 Пока ты ничего не пишешь, они молчат и ничего не тратят (кроме утреннего автопоста, если он включён).
 Ничего не публикуется в Инстаграм без твоего «ок»."""
@@ -198,7 +237,7 @@ class BudgetExceeded(Exception):
     pass
 
 
-HANDOFF = re.compile(r"\[\s*ДАЛЬШЕ\s*:\s*(scout|chief|inna)\s*\]", re.I)
+HANDOFF = re.compile(r"\[\s*ДАЛЬШЕ\s*:\s*(scout|chief|stats|inna)\s*\]", re.I)
 
 
 class Conductor:
@@ -207,8 +246,11 @@ class Conductor:
         self.c = client
         self.scout = Bot(client, cfg.tg_scout)
         self.ig = Bot(client, cfg.tg_ig)  # он же слушает группу
+        self.stats = Bot(client, cfg.tg_stats) if cfg.stats_on else None
+        self.keys = ("scout", "chief", "stats") if self.stats else ("scout", "chief")
         self.history = []  # [(кто, текст)]
-        self.material = ""  # последний отчёт и результаты поиска, их видит Разведчик
+        # материалы агентов: ключ -> (день, текст); Разведчик видит тренды, Аналитик статистику
+        self.materials = {}
         self.day = date.today()
         self.calls = 0
         self.lock = asyncio.Lock()  # одно обсуждение за раз
@@ -218,10 +260,13 @@ class Conductor:
         self._load()
 
     def bot_of(self, key):
-        return self.scout if key == "scout" else self.ig
+        return {"scout": self.scout, "chief": self.ig, "stats": self.stats}[key]
 
     def name_of(self, key):
-        return "Разведчик" if key == "scout" else "Главный по Инстаграму"
+        return {"scout": "Разведчик", "chief": "Главный по Инстаграму", "stats": "Аналитик"}[key]
+
+    def usernames(self):
+        return {k: self.bot_of(k).username for k in self.keys}
 
     # --- общая переписка
     def _load(self):
@@ -269,12 +314,14 @@ class Conductor:
     async def drive_token(self):
         return await asyncio.to_thread(self._token_sync)
 
-    async def latest_report(self):
-        """Самый свежий Google Doc из папки Меты или None, если папка пуста."""
+    async def latest_report(self, folder_id=None, title_prefix=None):
+        """Самый свежий Google Doc из папки (по умолчанию из папки Меты) или None, если пусто."""
+        folder_id = folder_id or self.cfg.folder_id
+        title_prefix = title_prefix or self.cfg.title_prefix
         headers = {"Authorization": f"Bearer {await self.drive_token()}"}
-        prefix = self.cfg.title_prefix.replace("\\", "\\\\").replace("'", "\\'")
+        prefix = title_prefix.replace("\\", "\\\\").replace("'", "\\'")
         query = (
-            f"'{self.cfg.folder_id}' in parents and trashed = false "
+            f"'{folder_id}' in parents and trashed = false "
             f"and mimeType = 'application/vnd.google-apps.document' "
             f"and name contains '{prefix}'"
         )
@@ -395,6 +442,55 @@ class Conductor:
         blocks = r.json().get("content", [])
         return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
+    async def openai(self, system, user):
+        r = await self.c.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.cfg.openai_key}"},
+            json={
+                "model": self.cfg.openai_model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # у моделей с рассуждением в этот лимит входят и «мысли», поэтому он большой
+                "max_completion_tokens": 3000,
+            },
+            timeout=120,
+        )
+        r.raise_for_status()
+        return (r.json()["choices"][0]["message"].get("content") or "").strip()
+
+    async def gather_stats(self):
+        """Свежий отчёт со статистикой из Metricool для Аналитика."""
+        if not self.cfg.use_stats_drive:
+            return (
+                "Папка со статистикой пока не подключена. Если тебя спросят про цифры, "
+                "честно скажи, что отчёта нет."
+            )
+        now = datetime.now(self.cfg.tz)
+        report = await self.latest_report(self.cfg.stats_folder_id, self.cfg.stats_prefix)
+        if not report:
+            return "Отчёт со статистикой в папке не найден. Так и скажи."
+        return (
+            f"Отчёт «{report['name']}», создан {report['created']:%d.%m.%Y %H:%M} "
+            f"(сегодня {now:%d.%m.%Y}):\n{report['text']}"
+        )
+
+    async def get_material(self, key, fresh, topic=None):
+        """Материалы агента: свежие по команде или раз в день, иначе из памяти."""
+        today = datetime.now(self.cfg.tz).date()
+        cached = self.materials.get(key)
+        if fresh or not cached or cached[0] != today:
+            if key == "scout":
+                text = await self.gather_material(topic)
+            elif key == "stats":
+                text = await self.gather_stats()
+            else:
+                return ""
+            self.materials[key] = (today, text)
+            return text
+        return cached[1]
+
     async def gather_material(self, topic):
         """Свежие данные для Разведчика: отчёт Меты из папки и/или веб-поиск."""
         if self.cfg.no_source:
@@ -434,21 +530,22 @@ class Conductor:
         self.spend()
         bot = self.bot_of(key)
         await bot.typing(chat)
-        if fresh:
-            self.material = await self.gather_material(topic)
-        persona = SCOUT_PERSONA if key == "scout" else CHIEF_PERSONA
-        system = persona + style_rules(self.scout.username, self.ig.username)
+        material = await self.get_material(key, fresh, topic)
+        persona = {"scout": SCOUT_PERSONA, "chief": CHIEF_PERSONA, "stats": STATS_PERSONA}[key]
+        system = persona + style_rules(self.usernames())
         if must_close:
             system += CLOSE_RULE
         user = f"Переписка в чате:\n{self.transcript()}\n\n"
-        if key == "scout" and self.material:
-            user += f"Твои материалы:\n{self.material}\n\n"
+        if material:
+            user += f"Твои материалы:\n{material}\n\n"
         user += "Твой ход."
         if instruction:
             user += f" {instruction}"
 
         if key == "scout":
             text = await self.groq(system, user)
+        elif key == "stats":
+            text = await self.openai(system, user)
         else:
             text = await self.claude(system, user)
 
@@ -456,8 +553,9 @@ class Conductor:
         nxt = m.group(1).lower() if m else "inna"
         text = HANDOFF.sub("", text).strip()
         text = re.sub(r"^\[[^\]\n]{1,40}\]:\s*", "", text)  # «[Разведчик]: » в начале не нужно
-        if nxt == key:  # самому себе слово не передают
-            nxt = "chief" if key == "scout" else "scout"
+        if nxt != "inna" and (nxt == key or nxt not in self.keys):
+            # самому себе слово не передают, и отсутствующему агенту тоже
+            nxt = next(k for k in ("chief", "scout", "stats") if k != key and k in self.keys)
 
         paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()] or [text or "…"]
         if len(paragraphs) > 4:
@@ -475,7 +573,7 @@ class Conductor:
     ):
         """Обсуждение: агенты по очереди передают слово, пока не дойдёт до Инны."""
         speaker, turns = first, 0
-        while speaker in ("scout", "chief") and turns < self.cfg.max_turns:
+        while speaker in self.keys and turns < self.cfg.max_turns:
             if turns and not self.inbox.empty():
                 break  # Инна написала: перебила, отвечаем ей
             first_turn = turns == 0
@@ -506,11 +604,25 @@ class Conductor:
             fresh=True,
         )
 
+    async def stats_talk(self, chat):
+        self.remember("Инна", "Как зашли наши последние рилсы?")
+        await self.converse(
+            chat,
+            "stats",
+            instruction=(
+                "Расскажи Инне и коллегам, как зашли рилсы за последний период из отчёта: назови "
+                "период и дату отчёта, одну-две главные цифры, что сработало лучше и что хуже. "
+                "Первое сообщение можно сделать длиннее (до 1000 символов). Потом коротко, что "
+                "это значит для решения «что снимать дальше», и передай слово Главному."
+            ),
+            fresh=True,
+        )
+
     # --- диспетчер: кто отвечает на свободное сообщение Инны
     async def route(self, text):
         try:
             out = await self.groq(
-                ROUTER_SYSTEM,
+                router_system(self.cfg.stats_on),
                 f"Переписка:\n{self.transcript()}\n\nНовое сообщение Инны: {text}",
                 max_tokens=5,
                 temperature=0,
@@ -519,8 +631,8 @@ class Conductor:
             log.warning("Диспетчер не сработал: %s", type(e).__name__)
             return "chief"
         word = out.strip().lower()
-        for key in ("scout", "chief", "none"):
-            if key in word:
+        for key in ("scout", "chief", "stats", "none"):
+            if key in word and (key != "stats" or self.cfg.stats_on):
                 return key
         return "chief"
 
@@ -572,7 +684,7 @@ class Conductor:
     def addressed_to(self, msg, text):
         low = text.lower()
         reply_id = (msg.get("reply_to_message") or {}).get("from", {}).get("id")
-        for key in ("scout", "chief"):
+        for key in self.keys:
             bot = self.bot_of(key)
             if (bot.username and f"@{bot.username}" in low) or reply_id == bot.id:
                 return key
@@ -607,12 +719,17 @@ class Conductor:
                 elif command == "/trends":
                     topic = text.split(maxsplit=1)[1].strip() if " " in text else ""
                     await self.trends(chat, topic)
+                elif command == "/stats":
+                    if self.stats:
+                        await self.stats_talk(chat)
+                    else:
+                        await self.ig.say(chat, "Аналитик пока не подключён.")
                 else:
                     target = self.addressed_to(msg, text)
                     self.remember("Инна", text)
                     if target is None:
                         target = await self.route(text)
-                    if target in ("scout", "chief"):
+                    if target in self.keys:
                         await self.converse(
                             chat, target, reply_to=msg.get("message_id")
                         )
@@ -642,9 +759,16 @@ class Conductor:
                 log.exception("Ошибка в обработчике")
 
     async def run(self):
-        await asyncio.gather(self.scout.start(), self.ig.start())
+        await asyncio.gather(*(self.bot_of(k).start() for k in self.keys))
         await self.ig.api("deleteWebhook")
-        log.info("Запущен. Разведчик @%s, Главный @%s", self.scout.username, self.ig.username)
+        log.info(
+            "Запущен. Разведчик @%s, Главный @%s%s",
+            self.scout.username,
+            self.ig.username,
+            f", Аналитик @{self.stats.username}" if self.stats else "",
+        )
+        if self.cfg.stats_on and not self.cfg.use_stats_drive:
+            log.warning("Аналитик включён, но папка статистики не подключена (STATS_FOLDER_ID)")
         if not (self.cfg.chat_id and self.cfg.owner_id):
             log.warning("GROUP_CHAT_ID или OWNER_ID не заданы: работает только команда /id")
         if self.cfg.no_source:
