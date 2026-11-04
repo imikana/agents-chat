@@ -173,6 +173,7 @@ HELP = """Просто пиши в чат, как людям: они сами р
 /trends — собрать их обсуждать свежий отчёт Меты (/trends тема, если про конкретную тему)
 /strategy — Главный подумает про стратегию: о чём рассказывать и как монетизировать (/strategy вопрос, если есть конкретный)
 /stats — Аналитик расскажет, как зашли последние рилсы (если он подключён)
+/office — кнопка, которая открывает офис, где они ходят и болтают
 
 Пока ты ничего не пишешь, они молчат и ничего не тратят (кроме утреннего автопоста, если он включён).
 Ничего не публикуется в Инстаграм без твоего «ок»."""
@@ -220,13 +221,15 @@ class Bot:
         self.id = me["id"]
         self.username = (me.get("username") or "").lower()
 
-    async def say(self, chat_id, text, reply_to=None):
+    async def say(self, chat_id, text, reply_to=None, markup=None):
         for i, chunk in enumerate(split_text(text)):
             params = {
                 "chat_id": chat_id,
                 "text": chunk,
                 "link_preview_options": {"is_disabled": True},
             }
+            if markup and i == 0:
+                params["reply_markup"] = markup
             if reply_to and i == 0:
                 params["reply_parameters"] = {
                     "message_id": reply_to,
@@ -777,6 +780,14 @@ class Conductor:
 
         if command == "/id":  # нужна один раз, чтобы узнать два числа для настроек
             await self.ig.say(chat, f"chat_id этой группы: {chat}\nТвой user_id: {user}")
+            return
+
+        if command == "/office":  # кнопка-ссылка на мини-приложение (в группах работают только ссылки t.me)
+            link = os.environ.get("OFFICE_LINK") or f"https://t.me/{self.ig.username}/office"
+            await self.ig.say(
+                chat, "Офис команды 👇",
+                markup={"inline_keyboard": [[{"text": "🏢 Открыть офис", "url": link}]]},
+            )
             return
 
         async with self.lock:
