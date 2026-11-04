@@ -14,10 +14,14 @@
 (через бота «Главный по Инстаграму»), ведёт общую переписку и даёт слово агентам.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import time
+from urllib.parse import parse_qsl
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -254,6 +258,10 @@ class Conductor:
         self.ig = Bot(client, cfg.tg_ig)  # он же слушает группу
         self.stats = Bot(client, cfg.tg_stats) if cfg.stats_on else None
         self.keys = ("scout", "chief", "stats") if self.stats else ("scout", "chief")
+        # для мини-приложения «Офис»: кто сейчас думает и последние реплики
+        self.status = {k: "idle" for k in self.keys}
+        self.feed = []
+        self._fid = 0
         self.history = []  # [(кто, текст)]
         # материалы агентов: ключ -> (день, текст); Разведчик видит тренды, Аналитик статистику
         self.materials = {}
@@ -282,6 +290,10 @@ class Conductor:
             self.history = []
 
     def remember(self, who, text):
+        names = {"Инна": "inna", "Разведчик": "scout", "Главный по Инстаграму": "chief", "Аналитик": "stats"}
+        self._fid += 1
+        self.feed.append({"id": self._fid, "who": names.get(who, "inna"), "text": text[:600], "ts": time.time()})
+        self.feed = self.feed[-30:]
         self.history.append((who, text))
         self.history = self.history[-40:]
         try:
@@ -553,6 +565,15 @@ class Conductor:
         self.spend()
         bot = self.bot_of(key)
         await bot.typing(chat)
+        self.status[key] = "thinking"
+        try:
+            return await self._speak(
+                key, bot, chat, instruction, topic, fresh, must_close, reply_to
+            )
+        finally:
+            self.status[key] = "idle"
+
+    async def _speak(self, key, bot, chat, instruction, topic, fresh, must_close, reply_to):
         material = await self.get_material(key, fresh, topic)
         plan = await self.get_plan()
         persona = {"scout": SCOUT_PERSONA, "chief": CHIEF_PERSONA, "stats": STATS_PERSONA}[key]
@@ -799,6 +820,21 @@ class Conductor:
                 except Exception:
                     pass
 
+    async def set_office_button(self):
+        """Кнопка «Офис» в личном чате Инны с ботом «Главный» открывает мини-приложение."""
+        url = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+        if not (url and self.cfg.owner_id and os.environ.get("PORT")):
+            return
+        try:
+            await self.ig.api(
+                "setChatMenuButton",
+                chat_id=self.cfg.owner_id,
+                menu_button={"type": "web_app", "text": "Офис", "web_app": {"url": url}},
+            )
+            log.info("Кнопка «Офис» поставлена")
+        except Exception as e:
+            log.warning("Кнопка «Офис» не поставлена (нужно один раз нажать Start у бота в личке): %s", e)
+
     async def worker(self):
         while True:
             msg = await self.inbox.get()
@@ -822,7 +858,8 @@ class Conductor:
             log.warning("GROUP_CHAT_ID или OWNER_ID не заданы: работает только команда /id")
         if self.cfg.no_source:
             log.warning("Источники трендов не подключены (папка Меты или TAVILY_API_KEY)")
-        self.health = await start_health()  # нужен, если сервис создан на Render как Web Service
+        self.health = await start_health(self)  # нужен, если сервис создан на Render как Web Service
+        await self.set_office_button()
         tasks = [  # noqa: F841 (держим ссылки)
             asyncio.create_task(self.worker()),
             asyncio.create_task(self.daily_loop()),
@@ -844,19 +881,67 @@ class Conductor:
                     await self.inbox.put(msg)
 
 
-async def start_health():
-    """Если Render дал порт (Web Service), отвечаем «ok» на любой запрос. Для Worker порта нет."""
+def check_init_data(init_data, token, owner_id, max_age=86400):
+    """Проверка подписи Telegram Mini App: открыть офис может только владелица."""
+    try:
+        data = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = data.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            return False
+        if time.time() - int(data.get("auth_date", "0")) > max_age:
+            return False
+        return int(json.loads(data.get("user", "{}")).get("id", 0)) == owner_id and owner_id != 0
+    except Exception:
+        return False
+
+
+OFFICE_FILE = Path(__file__).with_name("office.html")
+
+
+async def start_health(conductor=None):
+    """Если Render дал порт (Web Service): «ok» на проверку, а ещё мини-приложение «Офис»
+    (страница и закрытый /state). Для Worker порта нет, сервер не нужен."""
     port = os.environ.get("PORT")
     if not port:
         return None
 
+    def response(code, ctype, body):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        reason = {200: "OK", 403: "Forbidden", 404: "Not Found"}[code]
+        head = (
+            f"HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(data)}\r\n"
+            "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+        )
+        return head.encode("latin-1") + data
+
     async def handle(reader, writer):
         try:
-            await asyncio.wait_for(reader.readline(), timeout=5)
-            writer.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"
-                b"Connection: close\r\n\r\nok"
-            )
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            lines = head.decode("latin-1").split("\r\n")
+            path = lines[0].split(" ")[1].split("?")[0] if len(lines[0].split(" ")) > 1 else "/"
+            headers = {}
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            if conductor and path in ("/", "/office") and OFFICE_FILE.exists():
+                out = response(200, "text/html; charset=utf-8", OFFICE_FILE.read_bytes())
+            elif conductor and path == "/state":
+                if check_init_data(
+                    headers.get("x-init-data", ""), conductor.cfg.tg_ig, conductor.cfg.owner_id
+                ):
+                    body = json.dumps(
+                        {"status": conductor.status, "feed": conductor.feed[-12:]}, ensure_ascii=False
+                    )
+                    out = response(200, "application/json; charset=utf-8", body)
+                else:
+                    out = response(403, "text/plain", "forbidden")
+            else:
+                out = response(200, "text/plain", "ok")
+            writer.write(out)
             await writer.drain()
         except Exception:
             pass
